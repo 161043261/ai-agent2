@@ -1,0 +1,47 @@
+import { join } from 'path';
+import { StructuredTool } from '@langchain/core/tools';
+import { z } from 'zod';
+import ensureDir from './ensure-dir';
+import PDFDocument from 'pdfkit';
+import { createWriteStream } from 'fs';
+
+const OUTPUT_DIR = join(process.cwd(), './tmp/pdf');
+const FONT_PATH = join(process.cwd(), './assets/SarasaGothicSC-Regular.ttf');
+
+export class PdfGenerateTool extends StructuredTool {
+  name = PdfGenerateTool.name;
+  description = 'Generate a pdf file with content';
+  schema = z.object({
+    filename: z.string().describe('Generated pdf filename'),
+    content: z.string().describe('Content to be written to the pdf'),
+  });
+
+  async _call(args: { filename: string; content: string }): Promise<string> {
+    const { filename, content } = args;
+    const filepath = join(OUTPUT_DIR, filename);
+    try {
+      await ensureDir(OUTPUT_DIR);
+      const doc = new PDFDocument({
+        size: 'A4',
+        bufferPages: true,
+      });
+
+      const writeStream = createWriteStream(filepath);
+
+      return new Promise((resolve, reject) => {
+        writeStream.on('finish', () => {
+          resolve(`Pdf generated successfully to: ${filepath}`);
+        });
+
+        writeStream.on('error', (error: Error) => {
+          reject(error);
+        });
+        doc.pipe(writeStream);
+        doc.font(FONT_PATH).text(content).end();
+      });
+    } catch (err) {
+      console.error('Generating pdf error:', err);
+      return 'Generating pdf error';
+    }
+  }
+}
