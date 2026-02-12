@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment */
 import {
   Injectable,
   Logger,
@@ -12,17 +11,9 @@ import Sqlite3, { Database } from 'better-sqlite3';
 import { ConfigService } from '@nestjs/config';
 import { OllamaEmbeddings } from '@langchain/ollama';
 import { OpenAIEmbeddings } from '@langchain/openai';
-import { Matrix } from 'ml-matrix';
 import { dirname, join } from 'path';
 import { existsSync, readdirSync } from 'node:fs';
 import { mkdirSync, readFileSync } from 'fs';
-
-interface StoredDocument {
-  id: string;
-  content: string;
-  metadata: string;
-  embedding: string;
-}
 
 @Injectable()
 export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
@@ -76,7 +67,7 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
           baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
         },
       });
-      this.logger.log(`DashScope embedding initialized: ${embeddingModel}`);
+      this.logger.log(`Dashscope embedding initialized: ${embeddingModel}`);
     }
   }
 
@@ -195,117 +186,6 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
     );
     insertMany(documents, embeddings);
     this.logger.log(`Added ${documents.length} documents to vector store`);
-  }
-
-  // 批量计算查询向量与所有文档向量的余弦相似度
-  private batchCosineSimilarity(
-    queryEmbedding: number[],
-    docEmbeddings: number[][],
-  ): number[] {
-    // queryVec: 1 x D, docMatrix: N x D
-    const queryVec = new Matrix([queryEmbedding]);
-    const docMatrix = new Matrix(docEmbeddings);
-
-    // dot products: (1 x D) * (D x N) = 1 x N
-    const dots = queryVec.mmul(docMatrix.transpose());
-
-    // norms: per-row L2 norm
-    const queryNorm = queryVec.norm('frobenius');
-    const docNorms: number[] = [];
-    for (let i = 0; i < docMatrix.rows; i++) {
-      docNorms.push(new Matrix([docMatrix.getRow(i)]).norm('frobenius'));
-    }
-
-    const scores: number[] = [];
-    for (let i = 0; i < docEmbeddings.length; i++) {
-      const denom = queryNorm * docNorms[i];
-      scores.push(denom === 0 ? 0 : dots.get(0, i) / denom);
-    }
-    return scores;
-  }
-
-  // 相似度搜索
-  async similaritySearch(
-    query: string,
-    maxResults = 5,
-    minScore = 0.75,
-  ): Promise<Document[]> {
-    if (!this.db) {
-      return [];
-    }
-    try {
-      const queryEmbedding = await this.embeddings.embedQuery(query);
-      const rows = this.db
-        .prepare('SELECT * FROM documents')
-        .all() as StoredDocument[];
-      if (rows.length === 0) {
-        return [];
-      }
-
-      const docEmbeddings = rows.map(
-        (row) => JSON.parse(row.embedding) as number[],
-      );
-      const scores = this.batchCosineSimilarity(queryEmbedding, docEmbeddings);
-
-      const results: { doc: Document; score: number }[] = [];
-      for (let i = 0; i < rows.length; i++) {
-        if (scores[i] > minScore) {
-          results.push({
-            doc: new Document({
-              pageContent: rows[i].content,
-              metadata: JSON.parse(rows[i].metadata ?? '{}'),
-            }),
-            score: scores[i],
-          });
-        }
-      }
-      results.sort((a, b) => b.score - a.score);
-      const topResults = results.slice(0, maxResults).map((item) => item.doc);
-      this.logger.debug(`Found ${topResults.length} documents`);
-      return topResults;
-    } catch (err) {
-      this.logger.error('Similarity search failed:', err);
-      return [];
-    }
-  }
-
-  async similaritySearchWithScore(
-    query: string,
-    maxResults = 5,
-  ): Promise<[doc: Document, score: number][]> {
-    if (!this.db) {
-      return [];
-    }
-    try {
-      const queryEmbedding = await this.embeddings.embedQuery(query);
-      const rows = this.db
-        .prepare('SELECT * FROM documents')
-        .all() as StoredDocument[];
-      if (rows.length === 0) {
-        return [];
-      }
-
-      const docEmbeddings = rows.map(
-        (row) => JSON.parse(row.embedding) as number[],
-      );
-      const scores = this.batchCosineSimilarity(queryEmbedding, docEmbeddings);
-
-      const results: [doc: Document, score: number][] = [];
-      for (let i = 0; i < rows.length; i++) {
-        results.push([
-          new Document({
-            pageContent: rows[i].content,
-            metadata: JSON.parse(rows[i].metadata ?? '{}'),
-          }),
-          scores[i],
-        ]);
-      }
-      results.sort((a, b) => b[1] - a[1]);
-      return results.slice(0, maxResults);
-    } catch (err) {
-      this.logger.error('Similarity search with score failed:', err);
-      return [];
-    }
   }
 
   async clear(): Promise<void> {
