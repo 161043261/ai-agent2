@@ -12,6 +12,7 @@ import Sqlite3, { Database } from 'better-sqlite3';
 import { ConfigService } from '@nestjs/config';
 import { OllamaEmbeddings } from '@langchain/ollama';
 import { OpenAIEmbeddings } from '@langchain/openai';
+import { Matrix } from 'ml-matrix';
 import { dirname, join } from 'path';
 import { existsSync, readdirSync } from 'node:fs';
 import { mkdirSync, readFileSync } from 'fs';
@@ -26,10 +27,10 @@ interface StoredDocument {
 @Injectable()
 export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(VectorStoreService.name);
-  private embeddings: Embeddings;
   private db: Database | null = null;
-  private dbPath: string;
-  private sqlSnippets: string[] = [];
+  private readonly dbPath: string;
+  private readonly embeddings: Embeddings;
+  private readonly sqlSnippets: string[] = [];
 
   constructor(private readonly configService: ConfigService) {
     this.logger.debug('Current working directory:', process.cwd());
@@ -39,9 +40,7 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
     this.logger.warn(
       "'vector-store.service' is DEPRECATED, use 'rag.service' instead",
     );
-  }
 
-  async onModuleInit() {
     const provider = this.configService.get<string>('LLM_PROVIDER', 'ollama');
     this.dbPath = this.configService.get<string>(
       'VECTOR_DB_PATH',
@@ -49,10 +48,39 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
     );
 
     if (provider === 'ollama') {
-      this.initOllamaEmbeddings();
+      const baseUrl = this.configService.get<string>(
+        'OLLAMA_BASE_URL',
+        'http://localhost:11434',
+      );
+      const embeddingModel = this.configService.get<string>(
+        'OLLAMA_EMBEDDING_MODEL',
+        'nomic-embed-text',
+      );
+      this.embeddings = new OllamaEmbeddings({
+        baseUrl,
+        model: embeddingModel,
+      });
+      this.logger.log(
+        `Ollama embedding initialized: ${embeddingModel} at ${baseUrl}`,
+      );
     } else {
-      this.initDashScopeEmbeddings();
+      const apiKey = this.configService.get<string>('DASHSCOPE_API_KEY');
+      const embeddingModel = this.configService.get<string>(
+        'DASHSCOPE_EMBEDDING_MODEL',
+        'text-embedding-v4',
+      );
+      this.embeddings = new OpenAIEmbeddings({
+        openAIApiKey: apiKey,
+        modelName: embeddingModel,
+        configuration: {
+          baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        },
+      });
+      this.logger.log(`DashScope embedding initialized: ${embeddingModel}`);
     }
+  }
+
+  async onModuleInit() {
     await this.initDatabase();
   }
 
@@ -61,40 +89,6 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
       this.db.close();
       this.db = null;
     }
-  }
-
-  private initOllamaEmbeddings() {
-    const baseUrl = this.configService.get<string>(
-      'OLLAMA_BASE_URL',
-      'http://localhost:11434',
-    );
-    const embeddingModel = this.configService.get<string>(
-      'OLLAMA_EMBEDDING_MODEL',
-      'nomic-embed-text',
-    );
-    this.embeddings = new OllamaEmbeddings({
-      baseUrl,
-      model: embeddingModel,
-    });
-    this.logger.log(
-      `Ollama embedding initialized: ${embeddingModel} at ${baseUrl}`,
-    );
-  }
-
-  private initDashScopeEmbeddings() {
-    const apiKey = this.configService.get<string>('DASHSCOPE_API_KEY');
-    const embeddingModel = this.configService.get<string>(
-      'DASHSCOPE_EMBEDDING_MODEL',
-      'text-embedding-v4',
-    );
-    this.embeddings = new OpenAIEmbeddings({
-      openAIApiKey: apiKey,
-      modelName: embeddingModel,
-      configuration: {
-        baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-      },
-    });
-    this.logger.log(`DashScope embedding initialized: ${embeddingModel}`);
   }
 
   private async initDatabase() {
@@ -111,7 +105,7 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
         'CREATE INDEX IF NOT EXISTS idx_documents_created_at ON documents (created_at);',
       );
 
-      this.loadDocumentsFromDirectory(
+      await this.loadDocumentsFromDirectory(
         join(process.cwd(), './resources/docs/base'),
       );
 
@@ -203,6 +197,33 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
     this.logger.log(`Added ${documents.length} documents to vector store`);
   }
 
+  // 批量计算查询向量与所有文档向量的余弦相似度
+  private batchCosineSimilarity(
+    queryEmbedding: number[],
+    docEmbeddings: number[][],
+  ): number[] {
+    // queryVec: 1 x D, docMatrix: N x D
+    const queryVec = new Matrix([queryEmbedding]);
+    const docMatrix = new Matrix(docEmbeddings);
+
+    // dot products: (1 x D) * (D x N) = 1 x N
+    const dots = queryVec.mmul(docMatrix.transpose());
+
+    // norms: per-row L2 norm
+    const queryNorm = queryVec.norm('frobenius');
+    const docNorms: number[] = [];
+    for (let i = 0; i < docMatrix.rows; i++) {
+      docNorms.push(new Matrix([docMatrix.getRow(i)]).norm('frobenius'));
+    }
+
+    const scores: number[] = [];
+    for (let i = 0; i < docEmbeddings.length; i++) {
+      const denom = queryNorm * docNorms[i];
+      scores.push(denom === 0 ? 0 : dots.get(0, i) / denom);
+    }
+    return scores;
+  }
+
   // 相似度搜索
   async similaritySearch(
     query: string,
@@ -220,17 +241,21 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
       if (rows.length === 0) {
         return [];
       }
+
+      const docEmbeddings = rows.map(
+        (row) => JSON.parse(row.embedding) as number[],
+      );
+      const scores = this.batchCosineSimilarity(queryEmbedding, docEmbeddings);
+
       const results: { doc: Document; score: number }[] = [];
-      for (const row of rows) {
-        const docEmbedding = JSON.parse(row.embedding) as number[];
-        const score = this.cosineSimilarity(queryEmbedding, docEmbedding);
-        if (score > minScore) {
+      for (let i = 0; i < rows.length; i++) {
+        if (scores[i] > minScore) {
           results.push({
             doc: new Document({
-              pageContent: row.content,
-              metadata: JSON.parse(row.metadata ?? '{}'),
+              pageContent: rows[i].content,
+              metadata: JSON.parse(rows[i].metadata ?? '{}'),
             }),
-            score,
+            score: scores[i],
           });
         }
       }
@@ -259,16 +284,20 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
       if (rows.length === 0) {
         return [];
       }
+
+      const docEmbeddings = rows.map(
+        (row) => JSON.parse(row.embedding) as number[],
+      );
+      const scores = this.batchCosineSimilarity(queryEmbedding, docEmbeddings);
+
       const results: [doc: Document, score: number][] = [];
-      for (const row of rows) {
-        const docEmbedding = JSON.parse(row.embedding) as number[];
-        const score = this.cosineSimilarity(queryEmbedding, docEmbedding);
+      for (let i = 0; i < rows.length; i++) {
         results.push([
           new Document({
-            pageContent: row.content,
-            metadata: JSON.parse(row.metadata ?? '{}'),
+            pageContent: rows[i].content,
+            metadata: JSON.parse(rows[i].metadata ?? '{}'),
           }),
-          score,
+          scores[i],
         ]);
       }
       results.sort((a, b) => b[1] - a[1]);
@@ -277,25 +306,6 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
       this.logger.error('Similarity search with score failed:', err);
       return [];
     }
-  }
-
-  // 计算余弦相似度
-  private cosineSimilarity(a: number[], b: number[]): number {
-    if (a.length !== b.length) {
-      return 0;
-    }
-    let dotProduct = 0;
-    let normA = 0;
-    let normB = 0;
-    for (let i = 0; i < a.length; i++) {
-      dotProduct += a[i] * b[i];
-      normA += a[i] * a[i];
-      normB += b[i] * b[i];
-    }
-    if (normA === 0 || normB === 0) {
-      return 0;
-    }
-    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
   }
 
   async clear(): Promise<void> {
