@@ -15,54 +15,92 @@ import { BaseMessage } from '@langchain/core/messages';
 import { Document } from '@langchain/core/documents';
 import { join } from 'node:path';
 
-const DOCS_PATH = join(process.cwd(), './docs/base');
+const DOCS_PATH = join(process.cwd(), './docs');
 
 @Injectable()
 export class RagService implements OnModuleInit {
   private readonly logger = new Logger(RagService.name);
+  private readonly embeddings: Embeddings;
+  private readonly chatModel: BaseChatModel;
+  private readonly documentLoader: DocumentLoader;
   private vectorStore: MemoryVectorStore | null = null;
-  private embeddings!: Embeddings;
-  private chatModel!: BaseChatModel;
-  private documentLoader!: DocumentLoader;
   private documentRetriever: DocumentRetriever | null = null;
   private queryRewriter: QueryRewriter | null = null;
   private contextualAugmenter: ContextualQueryAugmenter | null = null;
   private keywordEnricher: KeywordEnricher | null = null;
-  private initializeSuccess: Promise<boolean> | null = null;
 
-  constructor(private readonly configService: ConfigService) {}
-
-  onModuleInit() {
-    this.logger.log('Documents path:', DOCS_PATH);
+  constructor(private readonly configService: ConfigService) {
     const provider = this.configService.get<LlmProvider>(
       'LLM_PROVIDER',
       'ollama',
     );
     if (provider === 'ollama') {
-      this.initOllama();
+      const baseUrl = this.configService.get<string>(
+        'OLLAMA_BASE_URL',
+        'http://localhost:11434',
+      );
+      const embeddingModel = this.configService.get<string>(
+        'OLLAMA_EMBEDDING_MODEL',
+        'nomic-embed-text',
+      );
+      const chatModelName = this.configService.get<string>(
+        'OLLAMA_CHAT_MODEL',
+        'qwen2.5',
+      );
+      this.embeddings = new OllamaEmbeddings({
+        baseUrl,
+        model: embeddingModel,
+      });
+      this.chatModel = new ChatOllama({ baseUrl, model: chatModelName });
+      this.logger.log(
+        `Ollama initialized: embedding=${embeddingModel}, chat=${chatModelName}`,
+      );
     } else {
-      this.initDashscope();
+      const apiKey = this.configService.get<string>('DASHSCOPE_API_KEY');
+      const embeddingModel = this.configService.get<string>(
+        'DASHSCOPE_EMBEDDING_MODEL',
+        'text-embedding-v4',
+      );
+      const chatModelName = this.configService.get<string>(
+        'DASHSCOPE_CHAT_MODEL',
+        'qwen-plus',
+      );
+      this.embeddings = new OpenAIEmbeddings({
+        openAIApiKey: apiKey || 'mock-key',
+        modelName: embeddingModel,
+        configuration: {
+          baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        },
+      });
+      this.chatModel = new ChatOpenAI({
+        openAIApiKey: apiKey || 'mock-key',
+        modelName: chatModelName,
+        configuration: {
+          baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        },
+      });
+      this.logger.log(
+        `Dashscope initialized: embedding=${embeddingModel}, chat=${chatModelName}`,
+      );
     }
     this.documentLoader = new DocumentLoader({
       chunkSize: 1000,
       chunkOverlap: 200,
     });
+  }
+
+  async onModuleInit() {
+    this.logger.log('Documents path:', DOCS_PATH);
     this.queryRewriter = new QueryRewriter(this.chatModel);
     this.logger.log('Query rewriter enabled');
     this.contextualAugmenter = new ContextualQueryAugmenter(this.chatModel);
     this.logger.log('Contextual query augmenter enabled');
     this.keywordEnricher = new KeywordEnricher(this.chatModel);
     this.logger.log('Keyword enricher enabled');
+    await this.initRag();
   }
 
-  private async ensureInitialized(): Promise<boolean> {
-    if (this.initializeSuccess === null) {
-      this.initializeSuccess = this.initialize();
-    }
-    return this.initializeSuccess;
-  }
-
-  private async initialize(): Promise<boolean> {
+  private async initRag() {
     try {
       const docs = await this.documentLoader.loadAndSplit(DOCS_PATH);
       if (docs.length === 0) {
@@ -79,87 +117,23 @@ export class RagService implements OnModuleInit {
         this.contextualAugmenter,
       );
       this.logger.log(`RAG initialized with ${docs.length} chunks`);
-      return true;
     } catch (err) {
       this.logger.error('Initialize RAG error:', err);
-      return false;
     }
-  }
-
-  private initOllama() {
-    const baseUrl = this.configService.get<string>(
-      'OLLAMA_BASE_URL',
-      'http://localhost:11434',
-    );
-    const embeddingModel = this.configService.get<string>(
-      'OLLAMA_EMBEDDING_MODEL',
-      'nomic-embed-text',
-    );
-    const chatModelName = this.configService.get<string>(
-      'OLLAMA_CHAT_MODEL',
-      'qwen2.5',
-    );
-    this.embeddings = new OllamaEmbeddings({ baseUrl, model: embeddingModel });
-    this.chatModel = new ChatOllama({ baseUrl, model: chatModelName });
-    this.logger.log(
-      `Ollama initialized: embedding=${embeddingModel}, chat=${chatModelName}`,
-    );
-  }
-
-  private initDashscope() {
-    const apiKey = this.configService.get<string>('DASHSCOPE_API_KEY');
-    const embeddingModel = this.configService.get<string>(
-      'DASHSCOPE_EMBEDDING_MODEL',
-      'text-embedding-v4',
-    );
-    const chatModelName = this.configService.get<string>(
-      'DASHSCOPE_CHAT_MODEL',
-      'qwen-plus',
-    );
-    this.embeddings = new OpenAIEmbeddings({
-      openAIApiKey: apiKey || 'mock-key',
-      modelName: embeddingModel,
-      configuration: {
-        baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-      },
-    });
-    this.chatModel = new ChatOpenAI({
-      openAIApiKey: apiKey || 'mock-key',
-      modelName: chatModelName,
-      configuration: {
-        baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-      },
-    });
-    this.logger.log(
-      `Dashscope initialized: embedding=${embeddingModel}, chat=${chatModelName}`,
-    );
   }
 
   async retrieve(
     query: string,
     chatHistory?: BaseMessage[],
   ): Promise<Document[]> {
-    const ok = await this.ensureInitialized();
-    if (!ok) {
-      return [];
-    }
     return this.documentRetriever?.retrieve(query, chatHistory) ?? [];
   }
 
   async retrieveAsContext(query: string, chatHistory?: BaseMessage[]) {
-    const ok = await this.ensureInitialized();
-    if (!ok) {
-      return '';
-    }
     return this.documentRetriever?.retrieveAsContext(query, chatHistory) ?? '';
   }
 
   async addDocuments(docs: Document[]): Promise<void> {
-    const ok = await this.ensureInitialized();
-    if (!ok) {
-      this.logger.warn('RAG not initialized, cannot add documents');
-      return;
-    }
     if (this.keywordEnricher) {
       docs = await this.keywordEnricher.enrichDocuments(docs);
     }
