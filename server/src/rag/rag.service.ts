@@ -23,17 +23,18 @@ export class RagService implements OnModuleInit {
   private readonly embeddings: Embeddings;
   private readonly chatModel: BaseChatModel;
   private readonly documentLoader: DocumentLoader;
+  private readonly queryRewriter: QueryRewriter;
+  private readonly contextualAugmenter: ContextualQueryAugmenter;
+  private readonly keywordEnricher: KeywordEnricher;
   private vectorStore: MemoryVectorStore | null = null;
   private documentRetriever: DocumentRetriever | null = null;
-  private queryRewriter: QueryRewriter | null = null;
-  private contextualAugmenter: ContextualQueryAugmenter | null = null;
-  private keywordEnricher: KeywordEnricher | null = null;
 
   constructor(private readonly configService: ConfigService) {
     const provider = this.configService.get<LlmProvider>(
       'LLM_PROVIDER',
       'ollama',
     );
+    // this.embeddings, this.chatModel
     if (provider === 'ollama') {
       const baseUrl = this.configService.get<string>(
         'OLLAMA_BASE_URL',
@@ -83,20 +84,18 @@ export class RagService implements OnModuleInit {
         `Dashscope initialized: embedding=${embeddingModel}, chat=${chatModelName}`,
       );
     }
+    // this.documentLoader
     this.documentLoader = new DocumentLoader({
       chunkSize: 1000,
       chunkOverlap: 200,
     });
+    this.queryRewriter = new QueryRewriter(this.chatModel);
+    this.contextualAugmenter = new ContextualQueryAugmenter(this.chatModel);
+    this.keywordEnricher = new KeywordEnricher(this.chatModel);
   }
 
   async onModuleInit() {
     this.logger.log('Documents path:', DOCS_PATH);
-    this.queryRewriter = new QueryRewriter(this.chatModel);
-    this.logger.log('Query rewriter enabled');
-    this.contextualAugmenter = new ContextualQueryAugmenter(this.chatModel);
-    this.logger.log('Contextual query augmenter enabled');
-    this.keywordEnricher = new KeywordEnricher(this.chatModel);
-    this.logger.log('Keyword enricher enabled');
     await this.initRag();
   }
 
@@ -134,14 +133,8 @@ export class RagService implements OnModuleInit {
   }
 
   async addDocuments(docs: Document[]): Promise<void> {
-    if (this.keywordEnricher) {
-      docs = await this.keywordEnricher.enrichDocuments(docs);
-    }
+    docs = await this.keywordEnricher.enrichDocuments(docs);
     await this.vectorStore!.addDocuments(docs);
     this.logger.log(`Added ${docs.length} documents to vector store`);
-  }
-
-  isAvailable(): boolean {
-    return this.vectorStore !== null;
   }
 }
